@@ -98,7 +98,7 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJS)
-	$(LD) $(LDFLAGS) -o $@ $(OBJS) -lcrypto -lc -lgcc
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) -lssl -lcrypto -lc -lgcc
 
 $(BIN): $(TARGET)
 	$(OBJCOPY) -O binary $< $@

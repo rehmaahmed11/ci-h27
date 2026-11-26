@@ -1,6 +1,8 @@
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -Isrc
-LDLIBS  ?= -lcrypto
+# SSL_CTX_new/SSL_connect/SSL_read/SSL_write live in libssl, and the EVP
+# primitives in libcrypto; libssl must come first because it depends on it.
+LDLIBS  ?= -lssl -lcrypto
 
 SRCDIR  := src
 INCDIR  := .

@@ -17,7 +17,7 @@ gcc -std=c11 -Wall -Wextra -O2 -Isrc \
     src/satip_server_full.c src/dlna_server.c src/crypto_ctr.c src/runtime.c \
     src/rtsp_server_loop.c src/ssdp_server_loop.c src/crypto_key_schedule.c src/runtime_e2e.c \
     src/menu.c \
-    -o build/cleanroom_p0 -lcrypto
+    -o build/cleanroom_p0 -lssl -lcrypto
 
 echo "Build OK: build/cleanroom_p0"
 ./build/cleanroom_p0

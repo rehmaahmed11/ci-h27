@@ -273,6 +273,20 @@ jobs:
           fi
           sudo apt-get install -y --no-install-recommends make libssl-dev binutils >>"$log" 2>&1
 
+          # "Package 'gcc-mipsel-linux-gnu' has no installation candidate" means apt
+          # knows the name but nothing offers it: every MIPS cross toolchain lives in
+          # Ubuntu's `universe` component, which runner images do not always enable.
+          if ! apt-cache policy gcc-mipsel-linux-gnu 2>/dev/null | grep -qE 'Candidate: *[0-9]'; then
+            echo "--- no candidate; enabling universe ---" >>"$log"
+            sudo add-apt-repository -y universe >>"$log" 2>&1
+            sudo apt-get update -y >>"$log" 2>&1
+            why="universe was not enabled (enabled it and re-ran apt-get update)"
+          fi
+          apt-cache policy gcc-mipsel-linux-gnu >>"$log" 2>&1
+          # The mipsel sysroot (libc + headers). Needed for any real device link and
+          # for the clang fallback below to compile against the right ABI.
+          sudo apt-get install -y --no-install-recommends libc6-dev-mipsel-cross >>"$log" 2>&1
+
           # Every MIPS package name Ubuntu/Debian has shipped, plus binutils on its
           # own (ar/objcopy/readelf are needed even if the compiler is absent).
           sudo apt-get install -y --no-install-recommends binutils-mipsel-linux-gnu >>"$log" 2>&1
@@ -296,8 +310,11 @@ jobs:
               cbin="$HOME/.local/crossbin"; mkdir -p "$cbin"
               cat > "$cbin/mipsel-linux-gnu-gcc" <<'WRAP'
           #!/bin/sh
-          exec clang --target=mipsel-linux-gnu -march=mips32 -mabi=32 -EL \
-               -isystem /usr/mipsel-linux-gnu/include -isystem /usr/include "$@"
+          # Only ever compile against the mipsel sysroot. Falling back to the host
+          # /usr/include would silently produce x86_64-ABI objects labelled MIPS.
+          SR=""
+          [ -d /usr/mipsel-linux-gnu ] && SR="--sysroot=/usr/mipsel-linux-gnu"
+          exec clang --target=mipsel-linux-gnu -march=mips32 -mabi=32 -EL $SR "$@"
           WRAP
               chmod +x "$cbin/mipsel-linux-gnu-gcc"
               for tool in ar ranlib nm objcopy objdump readelf size strip; do
@@ -306,11 +323,13 @@ jobs:
               done
               export PATH="$cbin:$PATH"
               printf '#include <stdio.h>\n#include <stdint.h>\nint main(void){uint32_t x=1;printf("%%u\\n",x);return 0;}\n' > /tmp/probe.c
-              if mipsel-linux-gnu-gcc -c /tmp/probe.c -o /tmp/probe.o 2>>"$log" \
+              if mipsel-linux-gnu-gcc -c /tmp/probe.c -o /tmp/probe.o 2>/tmp/probe.err \
                  && readelf -h /tmp/probe.o 2>/dev/null | grep -q "MIPS"; then
                 cross="mipsel-linux-gnu"; pkg="clang (target cross-compile, no MIPS gcc available)"
               else
-                why="clang MIPS probe did not produce a MIPS object"
+                cat /tmp/probe.err >>"$log"
+                probe_why=$(head -2 /tmp/probe.err 2>/dev/null | tr '\n' ' ' | cut -c1-180)
+                why="clang MIPS probe produced no MIPS object: ${probe_why:-readelf did not report EM_MIPS}"
                 rm -f "$cbin"/mipsel-linux-gnu-*
               fi
             else

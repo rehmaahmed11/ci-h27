@@ -1,0 +1,114 @@
+# MIPS cross-compile Makefile for the clean-room firmware (device build).
+#
+# The target is a MIPS32 *little-endian* receiver (ALi-class), so the default
+# cross prefix is mipsel-linux-gnu- and CFLAGS passes -EL.  A big-endian
+# prefix (mips-linux-gnu-) would compile but could not link against its own
+# big-endian libraries.
+#
+# Usage:
+#   make -f Makefile.mips objects   # cross-compile every translation unit
+#   make -f Makefile.mips archive   # -> build-mips/libcleanroom_mips.a
+#   make -f Makefile.mips           # full static link -> ELF + flashable BIN
+# CI:
+#   make -f Makefile.mips CROSS=mipsel-linux-gnu- objects archive
+# Requires: gcc-mipsel-linux-gnu (Ubuntu: apt install gcc-mipsel-linux-gnu) or
+#           mips-none-elf-gcc (bare-metal) + newlib.
+# The full link additionally needs a MIPS libcrypto (OpenSSL) and, on real
+# hardware, the SoC SDK that provides hal_init(); see BOOT_READINESS_GAP_REPORT.md.
+
+CROSS   ?= mipsel-linux-gnu-
+CC      := $(CROSS)gcc
+LD      := $(CROSS)gcc
+AR      := $(CROSS)ar
+OBJCOPY := $(CROSS)objcopy
+
+# Use static linking so libc (memcpy, memset, snprintf, etc.) is included.
+# -ffreestanding is NOT used: we rely on the static libc for string/memory helpers.
+# EXTRA_CFLAGS lets CI add e.g. -I/usr/include when only host OpenSSL headers are
+# available for the four translation units that include <openssl/*.h>.
+EXTRA_CFLAGS ?=
+CFLAGS  := -std=c11 -O2 -Wall -Wextra -Isrc \
+           -march=mips32 -mabi=32 -EL \
+           -DDEVICE_BUILD=1 \
+           -DCLEANROOM_RTSP_PORT=554 \
+           $(EXTRA_CFLAGS)
+LDFLAGS := -static \
+           -Wl,-Ttext,0x80000e00 \
+           -Wl,--entry,app_main \
+           -Wl,--defsym,gp=0x81023ddc
+
+SRCDIR  := src
+BUILDDIR:= build-mips
+
+SRCS    := $(SRCDIR)/device_main.c \
+           $(SRCDIR)/common.c \
+           $(SRCDIR)/fw_update.c \
+           $(SRCDIR)/fw_nvm.c \
+           $(SRCDIR)/cam_keys.c \
+           $(SRCDIR)/cam_server.c \
+           $(SRCDIR)/crypto_tls.c \
+           $(SRCDIR)/cccam_client.c \
+           $(SRCDIR)/net_transport.c \
+           $(SRCDIR)/yt_proxy.c \
+           $(SRCDIR)/iptv_backend.c \
+           $(SRCDIR)/dvb_ts_mux.c \
+           $(SRCDIR)/satip_server.c \
+           $(SRCDIR)/rtsp_server.c \
+           $(SRCDIR)/dlna_service.c \
+           $(SRCDIR)/guardrails.c \
+           $(SRCDIR)/cam_frame.c \
+           $(SRCDIR)/http_client.c \
+           $(SRCDIR)/yt_api.c \
+           $(SRCDIR)/iptv_client.c \
+           $(SRCDIR)/orchestrator.c \
+           $(SRCDIR)/token_ledger.c \
+           $(SRCDIR)/net_socket.c \
+           $(SRCDIR)/rtsp_server_full.c \
+           $(SRCDIR)/satip_server_full.c \
+           $(SRCDIR)/dlna_server.c \
+           $(SRCDIR)/crypto_ctr.c \
+           $(SRCDIR)/runtime.c \
+           $(SRCDIR)/rtsp_server_loop.c \
+           $(SRCDIR)/ssdp_server_loop.c \
+           $(SRCDIR)/crypto_key_schedule.c \
+           $(SRCDIR)/runtime_e2e.c \
+           $(SRCDIR)/menu.c
+
+OBJS    := $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
+
+TARGET  := $(BUILDDIR)/cleanroom_mips.elf
+BIN     := $(BUILDDIR)/cleanroom_mips.bin
+ARCHIVE := $(BUILDDIR)/libcleanroom_mips.a
+
+# `all` produces the flashable ELF+BIN and needs a MIPS libcrypto (and, on real
+# hardware, the SoC SDK).  `objects`/`archive` stop short of that link, so CI can
+# still prove the whole tree cross-compiles for MIPS32 LE and publish a real
+# MIPS artifact even when no MIPS libcrypto is installed.
+all: $(BIN)
+objects: $(OBJS)
+archive: $(ARCHIVE)
+
+$(ARCHIVE): $(OBJS)
+	@mkdir -p $(BUILDDIR)
+	rm -f $@
+	$(AR) rcs $@ $(OBJS)
+
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c
+	@mkdir -p $(BUILDDIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(TARGET): $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) -lcrypto -lc -lgcc
+
+$(BIN): $(TARGET)
+	$(OBJCOPY) -O binary $< $@
+
+clean:
+	rm -rf $(BUILDDIR)
+
+# `make -f Makefile.mips print-OBJS` lets CI ask for the authoritative object
+# list instead of guessing from src/*.c (the device build uses device_main.c,
+# not main.c, so the two lists differ).
+print-%: ; @echo '$($*)'
+
+.PHONY: all clean objects archive

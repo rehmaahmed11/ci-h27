@@ -32,9 +32,28 @@ static SSL *http_tls_connect(int fd, int tls_version)
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
 
-    if (tls_version == HTTP_TLS_TLS13) { ctx = SSL_CTX_new(TLSv1_3_method()); }
-    else { ctx = SSL_CTX_new(TLSv1_2_method()); }
+    /* TLSv1_2_method()/TLSv1_3_method() must not be used here:
+     *   - the version-specific constructors are deprecated since OpenSSL 1.1.0
+     *     (-Wdeprecated-declarations, and an error once deprecations are fatal);
+     *   - TLSv1_3_method() is not a public API in any released OpenSSL, so
+     *     referencing it is an implicit declaration, which GCC >= 14 rejects.
+     * Negotiate with the generic method and pin the version range instead; this
+     * is portable from OpenSSL 1.0.2 through 3.x. */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    ctx = SSL_CTX_new(TLS_method());
+#else
+    ctx = SSL_CTX_new(SSLv23_method());
+#endif
     if (ctx == NULL) { return NULL; }
+#ifdef TLS1_2_VERSION
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+#endif
+#if defined(TLS1_3_VERSION)
+    SSL_CTX_set_max_proto_version(ctx, tls_version == HTTP_TLS_TLS13 ? TLS1_3_VERSION
+                                                                    : TLS1_2_VERSION);
+#elif defined(TLS1_2_VERSION)
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+#endif
     ssl = SSL_new(ctx);
     SSL_set_fd(ssl, fd);
     SSL_set_connect_state(ssl);

@@ -203,6 +203,10 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
           mkdir -p "$CIOUT/stage-host"
           cp -v "$CR/build/cleanroom_p0" "$CIOUT/stage-host/" 2>/dev/null || true
@@ -255,23 +259,79 @@ jobs:
         id: cross
         run: |
           set -uo pipefail
-          for i in 1 2 3; do sudo apt-get update -y && break || sleep 5; done
-          sudo apt-get install -y --no-install-recommends make libssl-dev binutils || true
-          pkg=""
-          for cand in gcc-mipsel-linux-gnu gcc-mips-linux-gnu; do
-            if sudo apt-get install -y --no-install-recommends "$cand"; then pkg="$cand"; break; fi
+          set +e
+          mkdir -p "$CIOUT"
+          log="$CIOUT/cross-toolchain-install.log"
+          : > "$log"
+          cross=""; pkg=""; why=""
+
+          # Runner images no longer always ship populated apt lists, so an install
+          # without a working update fails with "Unable to locate package".
+          if ! sudo apt-get update -y >>"$log" 2>&1; then
+            sudo apt-get update -y >>"$log" 2>&1
+            why="apt-get update failed"
+          fi
+          sudo apt-get install -y --no-install-recommends make libssl-dev binutils >>"$log" 2>&1
+
+          # Every MIPS package name Ubuntu/Debian has shipped, plus binutils on its
+          # own (ar/objcopy/readelf are needed even if the compiler is absent).
+          sudo apt-get install -y --no-install-recommends binutils-mipsel-linux-gnu >>"$log" 2>&1
+          for cand in gcc-mipsel-linux-gnu gcc-mips-linux-gnu \
+                      gcc-mips64el-linux-gnuabi64 gcc-mipsisa32r6el-linux-gnu; do
+            if sudo apt-get install -y --no-install-recommends "$cand" >>"$log" 2>&1; then
+              pkg="$cand"; break
+            fi
+            why="$(grep -m1 -E 'Unable to locate|E:|Depends' "$log" | tail -1)"
           done
-          cross=""
-          for p in mipsel-linux-gnu mips-linux-gnu; do
-            if command -v "${p}-gcc" >/dev/null 2>&1; then cross="$p"; break; fi
+          for pref in mipsel-linux-gnu mips-linux-gnu mips64el-linux-gnuabi64 mipsisa32r6el-linux-gnu; do
+            if command -v "${pref}-gcc" >/dev/null 2>&1; then cross="$pref"; break; fi
           done
+
+          # Fallback: clang cross-compiles to MIPS32 LE with no MIPS gcc installed.
+          # Only accepted if a real probe compiles AND readelf confirms EM_MIPS, so
+          # this can never report a toolchain that does not actually work.
+          if [ -z "$cross" ]; then
+            sudo apt-get install -y --no-install-recommends clang lld llvm >>"$log" 2>&1
+            if command -v clang >/dev/null 2>&1; then
+              cbin="$HOME/.local/crossbin"; mkdir -p "$cbin"
+              cat > "$cbin/mipsel-linux-gnu-gcc" <<'WRAP'
+          #!/bin/sh
+          exec clang --target=mipsel-linux-gnu -march=mips32 -mabi=32 -EL \
+               -isystem /usr/mipsel-linux-gnu/include -isystem /usr/include "$@"
+          WRAP
+              chmod +x "$cbin/mipsel-linux-gnu-gcc"
+              for tool in ar ranlib nm objcopy objdump readelf size strip; do
+                src="$(command -v "llvm-$tool" 2>/dev/null || command -v "$tool" 2>/dev/null)"
+                [ -n "$src" ] && ln -sf "$src" "$cbin/mipsel-linux-gnu-$tool"
+              done
+              export PATH="$cbin:$PATH"
+              printf '#include <stdio.h>\n#include <stdint.h>\nint main(void){uint32_t x=1;printf("%%u\\n",x);return 0;}\n' > /tmp/probe.c
+              if mipsel-linux-gnu-gcc -c /tmp/probe.c -o /tmp/probe.o 2>>"$log" \
+                 && readelf -h /tmp/probe.o 2>/dev/null | grep -q "MIPS"; then
+                cross="mipsel-linux-gnu"; pkg="clang (target cross-compile, no MIPS gcc available)"
+              else
+                why="clang MIPS probe did not produce a MIPS object"
+                rm -f "$cbin"/mipsel-linux-gnu-*
+              fi
+            else
+              why="${why:-no MIPS gcc package could be installed and clang is unavailable}"
+            fi
+          fi
+
           echo "cross=$cross" >> "$GITHUB_OUTPUT"
           echo "package=$pkg" >> "$GITHUB_OUTPUT"
+          echo "why=$why" >> "$GITHUB_OUTPUT"
           if [ -n "$cross" ]; then
-            echo "cross toolchain: ${cross}-gcc -> $(${cross}-gcc --version | head -1)"
+            echo "cross toolchain: ${cross}-gcc -> $(${cross}-gcc --version 2>&1 | head -1)"
+            echo "installed via: ${pkg:-preinstalled}"
           else
-            echo "::warning title=device::no MIPS cross compiler could be installed"
+            # The apt/clang reason goes into an annotation, so it is readable from
+            # the run page and from the check-runs API without downloading logs.
+            detail="$(grep -m3 -E 'Unable to locate|E: |error:|not going to be installed' "$log" | tr '\n' '|' | cut -c1-300)"
+            echo "::warning title=device/cross-install::no MIPS cross compiler available. ${why}. apt said: ${detail:-no apt error captured}"
           fi
+          echo "--- cross-toolchain-install.log (tail) ---"
+          tail -25 "$log"
 
       - name: Start trace
         run: |
@@ -280,7 +340,7 @@ jobs:
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" init --job device
           if [ -n "${{ steps.cross.outputs.cross }}" ]; then st=ok; else st=degraded; fi
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name cross-toolchain --status "$st" \
-            --message "cross=${{ steps.cross.outputs.cross || 'none' }} package=${{ steps.cross.outputs.package || 'none' }} device_link=$DEVICE_LINK"
+            --message "cross=${{ steps.cross.outputs.cross || 'none' }} package=${{ steps.cross.outputs.package || 'none' }} device_link=$DEVICE_LINK reason=${{ steps.cross.outputs.why || 'none' }}"
 
       - name: Cross-compile every translation unit
         id: compile
@@ -372,7 +432,12 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
-          objs=$(ls "$CR"/build-mips/*.o 2>/dev/null | wc -l)
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          mkdir -p "$CR/build-mips"
+          objs=$(find "$CR/build-mips" -maxdepth 1 -name '*.o' 2>/dev/null | wc -l) || objs=0
           # Authoritative expectation comes from the Makefile, not from src/*.c:
           # the device build compiles device_main.c instead of main.c.
           # (--no-print-directory + grep: "Entering/Leaving directory" banners
@@ -395,13 +460,22 @@ jobs:
             echo "- device_link policy: \`$DEVICE_LINK\`"
             echo "- flashable maincode: $([ -f "$bin" ] && echo 'yes' || echo 'no — the package job stages a 0xFF placeholder and marks the image NOT FLASHABLE')"
             echo
-            if [ "$objs" -lt "$srcs" ]; then
+            if [ "$objs" -gt 0 ] && [ "$objs" -lt "$srcs" ]; then
               echo "## Translation units that did not cross-compile"
               echo
               echo "\`compile-matrix.md\` lists them one by one and the compiler stderr for"
               echo "each is in \`ERRORS.md\` / \`steps/*device-compile*.err\`. The usual cause"
               echo "on a stock runner is that the cross sysroot has no OpenSSL headers for"
               echo "the four units that include \`<openssl/*.h>\`."
+              echo
+            fi
+            if [ "$objs" -eq 0 ]; then
+              echo "## No translation unit could be cross-compiled"
+              echo
+              echo "Toolchain resolution: \`${{ steps.cross.outputs.why || 'unknown' }}\`."
+              echo "\`cross-toolchain-install.log\` in this artifact holds the full apt"
+              echo "and clang output. Install \`gcc-mipsel-linux-gnu\` (or run on a"
+              echo "self-hosted runner that has it) and re-run."
               echo
             fi
             if [ ! -f "$bin" ]; then
@@ -439,12 +513,18 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
           mkdir -p "$CIOUT/stage-device"
           for f in libcleanroom_mips.a cleanroom_mips.elf cleanroom_mips.bin \
                    compile-matrix.md DEVICE_BUILD_STATUS.md device-binary-info.txt; do
             [ -f "$CR/build-mips/$f" ] && cp -v "$CR/build-mips/$f" "$CIOUT/stage-device/"
           done
+          [ -f "$CIOUT/cross-toolchain-install.log" ] \
+            && cp -v "$CIOUT/cross-toolchain-install.log" "$CIOUT/stage-device/"
           cp -rv "$CIOUT"/report/* "$CIOUT/stage-device/" 2>/dev/null || true
           (cd "$CIOUT/stage-device" && sha256sum ./* 2>/dev/null | tee SHA256SUMS.txt) || true
 
@@ -571,6 +651,10 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
           mkdir -p "$CIOUT/stage-flash"
           for f in "$CR/build/flash_image.bin" "$CR/build/FLASH_IMAGE_README.txt" \
@@ -635,6 +719,10 @@ jobs:
       - name: Merge traces into one report
         run: |
           set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
           mkdir -p "$CIOUT/report"
           SOURCES=()
           for d in "$CIOUT"/traces/*/; do [ -d "$d" ] && SOURCES+=("$d"); done
@@ -652,6 +740,10 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
           {
             echo "### Pipeline"
             echo
@@ -680,6 +772,10 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
           rc=0
           echo "prepare=${{ needs.prepare.result }} host=${{ needs.host.result }} device=${{ needs.device.result }} package=${{ needs.package.result }}"
           [ "${{ needs.prepare.result }}" = "success" ] || rc=1

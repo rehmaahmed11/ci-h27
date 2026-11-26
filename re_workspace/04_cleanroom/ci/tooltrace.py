@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,7 @@ from datetime import datetime, timezone
 
 TRACE_VERSION = 1
 DEFAULT_DIR = os.environ.get("TOOLTRACE_DIR", "ci-out/trace")
-MAX_INLINE_LOG_LINES = 200
+MAX_INLINE_LOG_LINES = 400
 IN_GHA = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
@@ -315,7 +316,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     append_record(tdir, rec)
     gh("endgroup::")
 
-    tail = _tail(err_log, 12) or _tail(out_log, 12)
+    # lead with the diagnostics; keep the tail as a fallback for non-compiler tools
+    digest = _error_digest(err_log) or _error_digest(out_log)
+    tail = " | ".join(digest) if digest else (_tail(err_log, 12) or _tail(out_log, 12))
     if status == "fail":
         title = f"{args.job}/{args.name} failed (exit {code})"
         gh(f"error title={gha_escape(title)}::"
@@ -333,13 +336,57 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if status != "fail" else code
 
 
-def _tail(path: str, n: int) -> str:
+def _read_lines(path: str) -> list:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = [l.rstrip() for l in f if l.strip()]
+            return [l.rstrip() for l in f if l.strip()]
     except OSError:
+        return []
+
+
+# What a human actually needs from a failed build: the diagnostics, not the last
+# few lines of whatever happened to be printed. Compiler and linker messages are
+# recognised so the annotation leads with the cause instead of trailing context.
+_ERROR_RE = re.compile(
+    r"(?:error:|fatal error:|undefined reference|multiple definition|"
+    r"cannot find|No such file|not declared|implicit declaration|"
+    r"\*\*\* \[|Error \d+|ld returned|collect2:)", re.IGNORECASE)
+
+
+def _error_digest(path: str, budget: int = 4000) -> list:
+    """The lines that explain a failure, as a list (callers choose the joiner)."""
+    lines = _read_lines(path)
+    if not lines:
+        return []
+    hits, seen = [], set()
+    for i, l in enumerate(lines):
+        if _ERROR_RE.search(l):
+            for cand in lines[max(0, i - 1):i + 2]:   # one line of context either side
+                if cand not in seen:
+                    seen.add(cand)
+                    hits.append(cand)
+    picked = hits or lines[-12:]
+    out, used = [], 0
+    for l in picked:
+        if used + len(l) + 1 > budget:
+            out.append(f"... [{len(picked) - len(out)} more line(s) in {os.path.basename(path)}] ...")
+            break
+        out.append(l)
+        used += len(l) + 1
+    return out
+
+
+def _tail(path: str, n: int, budget: int = 4000) -> str:
+    lines = _read_lines(path)
+    if not lines:
         return ""
-    return " | ".join(lines[-n:])[-400:]
+    out, used = [], 0
+    for l in lines[-n:]:
+        if used + len(l) + 3 > budget:
+            break
+        out.append(l)
+        used += len(l) + 3
+    return " | ".join(out)
 
 
 def cmd_note(args: argparse.Namespace) -> int:
@@ -538,7 +585,11 @@ def render_errors(records: list[dict], tdir: str) -> str:
         ]
         if r.get("message"):
             lines += [f"> {r['message']}", ""]
-        err_text = _read_log(os.path.join(tdir, r.get("stderr_log", "")), MAX_INLINE_LOG_LINES)
+        err_path = os.path.join(tdir, r.get("stderr_log", ""))
+        digest = _error_digest(err_path, budget=8000)
+        if digest:
+            lines += ["### What actually failed", "", "```", *digest, "```", ""]
+        err_text = _read_log(err_path, MAX_INLINE_LOG_LINES)
         if err_text:
             lines += ["### stderr", "", "```", err_text, "```", ""]
         else:

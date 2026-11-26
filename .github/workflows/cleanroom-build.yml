@@ -1,0 +1,878 @@
+name: CleanRoom Firmware CI
+
+# ---------------------------------------------------------------------------
+# Pipeline: prepare -> (host | device) -> package -> report
+#
+# Every stage is run *through* ci/tooltrace.py, so the artifacts answer:
+#   * which tools ran, in which order, at which version   -> TOOLCHAIN.md
+#   * which file fed which tool, with a SHA-256 per hop   -> ARTIFACT_CHAIN.md
+#   * why anything failed, with the stderr inline         -> ERRORS.md
+# The `report` job runs with `if: always()` and merges the per-job traces, so
+# the tool chain and the error logs are downloadable even from a failed run.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main, "arena/**"]
+    paths:
+      - "re_workspace/04_cleanroom/**"
+      - ".github/workflows/cleanroom-build.yml"
+      - "h27.zip"
+  pull_request:
+    paths:
+      - "re_workspace/04_cleanroom/**"
+      - ".github/workflows/cleanroom-build.yml"
+      - "h27.zip"
+  workflow_dispatch:
+    inputs:
+      device_link:
+        description: "Device (MIPS) static link: 'required' fails the run if no MIPS libcrypto is available"
+        type: choice
+        default: optional
+        options:
+          - optional
+          - required
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanroom-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CR: re_workspace/04_cleanroom   # clean-room source root
+  CIOUT: ci-out                   # scratch space (gitignored)
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ----------------------------------------------------------------------- #
+  prepare:
+    name: Prepare tree + probe toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TRACE: ci-out/trace-prepare
+      TOOLTRACE_JOB: prepare
+    outputs:
+      tree_source: ${{ steps.tree.outputs.tree_source }}
+      manifest_sha: ${{ steps.manifest.outputs.manifest_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure the clean-room tree exists (extract h27.zip if needed)
+        id: tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$CIOUT"
+          python3 "$CR/ci/ensure_tree.py" --manifest "$CIOUT/tree-manifest.json"
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json
+          d = json.load(open("ci-out/tree-manifest.json"))
+          print(f"tree_source={d['tree_source']}")
+          print(f"file_count={d['file_count']}")
+          PY
+
+      - name: Start trace
+        run: |
+          set -euo pipefail
+          mkdir -p "$TRACE/steps" "$CIOUT/report"
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" init --job prepare
+
+      - name: Record source inventory (chain root)
+        id: manifest
+        run: |
+          set -euo pipefail
+          SHA=$(python3 -c "import json;print(json.load(open('ci-out/tree-manifest.json'))['manifest_sha256'])")
+          echo "manifest_sha=$SHA" >> "$GITHUB_OUTPUT"
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name source-inventory \
+            --status ok \
+            --message "tree=${{ steps.tree.outputs.tree_source }} files=${{ steps.tree.outputs.file_count }} manifest_sha256=${SHA:0:16}" \
+            --produces "$CIOUT/tree-manifest.json"
+
+      - name: Probe runner environment
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run --name runner-environment \
+            --produces "$CIOUT/runner-environment.txt" \
+            -- bash -c '{ uname -a; echo; (lsb_release -a || cat /etc/os-release); echo; nproc; echo; free -m; echo; df -h "$PWD"; echo; id; } > "$CIOUT/runner-environment.txt" 2>&1'
+
+      - name: Render prepare report
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
+
+      - name: Upload source manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-manifest
+          path: ${{ env.CIOUT }}/tree-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload prepare trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-prepare
+          path: ${{ env.CIOUT }}/trace-prepare/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ----------------------------------------------------------------------- #
+  host:
+    name: Host build + self-test
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 20
+    env:
+      TRACE: ci-out/trace-host
+      TOOLTRACE_JOB: host
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore source manifest (chained from prepare)
+        uses: actions/download-artifact@v4
+        with:
+          name: source-manifest
+          path: ${{ env.CIOUT }}
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do sudo apt-get update -y && break || sleep 5; done
+          sudo apt-get install -y --no-install-recommends build-essential libssl-dev
+
+      - name: Start trace
+        run: |
+          set -euo pipefail
+          mkdir -p "$TRACE/steps" "$CIOUT/report" "$CIOUT/stage-host"
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" init --job host
+
+      - name: Build (gcc + libcrypto)
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name host-build --cwd "$CR" --tool make --timeout 900 \
+            --consumes "$CIOUT/tree-manifest.json" \
+            --produces "$CR/build/cleanroom_p0" \
+            -- make clean all
+
+      - name: Run self-tests
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name host-selftest --cwd "$CR" --timeout 300 \
+            --consumes "$CR/build/cleanroom_p0" \
+            --produces "$CR/build/selftest.log" \
+            -- bash -c 'set -o pipefail; ./build/cleanroom_p0 2>&1 | tee build/selftest.log'
+
+      - name: Record binary facts
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name host-binary-info --cwd "$CR" --tool bash \
+            --consumes "$CR/build/cleanroom_p0" \
+            --produces "$CR/build/host-binary-info.txt" \
+            -- bash -c '{ file build/cleanroom_p0; echo; size build/cleanroom_p0; echo; ldd build/cleanroom_p0; echo; sha256sum build/cleanroom_p0; echo; echo "defined symbols: $(nm --defined-only build/cleanroom_p0 | wc -l)"; } > build/host-binary-info.txt 2>&1'
+
+      - name: Render trace report (chain for the verifier)
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report"
+
+      - name: Verify host artifacts
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name host-verify --tool python3 --timeout 300 \
+            --consumes "$CR/build/cleanroom_p0,$CR/build/selftest.log,$CIOUT/report/artifact-chain.json" \
+            --produces "$CIOUT/report/host-VERIFICATION.md,$CIOUT/report/host-verification.json" \
+            -- python3 "$CR/ci/verify_artifacts.py" \
+                 --elf "$CR/build/cleanroom_p0" --expect-machine x86-64 --expect-endian little \
+                 --selftest-log "$CR/build/selftest.log" --expect "ALL TESTS PASSED" \
+                 --chain "$CIOUT/report/artifact-chain.json" \
+                 --out-json "$CIOUT/report/host-verification.json" \
+                 --out-md "$CIOUT/report/host-VERIFICATION.md"
+
+      - name: Final report + stage artifact
+        if: always()
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
+          mkdir -p "$CIOUT/stage-host"
+          cp -v "$CR/build/cleanroom_p0" "$CIOUT/stage-host/" 2>/dev/null || true
+          cp -v "$CR/build/selftest.log" "$CR/build/host-binary-info.txt" "$CIOUT/stage-host/" 2>/dev/null || true
+          cp -rv "$CIOUT"/report/* "$CIOUT/stage-host/" 2>/dev/null || true
+          sha256sum "$CIOUT"/stage-host/* 2>/dev/null | tee "$CIOUT/stage-host/SHA256SUMS.txt" || true
+
+      - name: Upload host artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanroom-host
+          path: ${{ env.CIOUT }}/stage-host/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload host trace (tool chain + error logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-host
+          path: ${{ env.CIOUT }}/trace-host/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ----------------------------------------------------------------------- #
+  device:
+    name: Device build (MIPS32 LE)
+    # Pinned deliberately. `ubuntu-latest` is ubuntu-26.04, and Ubuntu dropped
+    # mipsel when Debian dropped it for trixie: there apt reports
+    # "Package 'gcc-mipsel-linux-gnu' has no installation candidate" and
+    # binutils/libc6 -mipsel-cross are gone entirely, so no amount of
+    # universe-enabling helps. noble still ships the whole cross toolchain.
+    runs-on: ubuntu-24.04
+    needs: prepare
+    timeout-minutes: 25
+    env:
+      TRACE: ci-out/trace-device
+      TOOLTRACE_JOB: device
+      DEVICE_LINK: ${{ github.event.inputs.device_link || 'optional' }}
+    outputs:
+      link_status: ${{ steps.status.outputs.link_status }}
+      objects: ${{ steps.status.outputs.objects }}
+      device_bin: ${{ steps.status.outputs.device_bin }}
+      toolchain: ${{ steps.status.outputs.toolchain }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore source manifest (chained from prepare)
+        uses: actions/download-artifact@v4
+        with:
+          name: source-manifest
+          path: ${{ env.CIOUT }}
+
+      - name: Install MIPS cross toolchain
+        id: cross
+        run: |
+          set -uo pipefail
+          set +e
+          mkdir -p "$CIOUT"
+          log="$CIOUT/cross-toolchain-install.log"
+          : > "$log"
+          cross=""; pkg=""; why=""
+          { echo "--- runner ---"
+            . /etc/os-release 2>/dev/null && echo "os: $PRETTY_NAME ($VERSION_CODENAME)"
+            echo "arch: $(dpkg --print-architecture 2>/dev/null)"
+            echo "runner: ${RUNNER_OS:-?} / ${RUNNER_NAME:-?}"
+          } >>"$log" 2>&1
+
+          # Runner images no longer always ship populated apt lists, so an install
+          # without a working update fails with "Unable to locate package".
+          if ! sudo apt-get update -y >>"$log" 2>&1; then
+            sudo apt-get update -y >>"$log" 2>&1
+            why="apt-get update failed"
+          fi
+          sudo apt-get install -y --no-install-recommends make libssl-dev binutils >>"$log" 2>&1
+
+          # "Package 'gcc-mipsel-linux-gnu' has no installation candidate" means apt
+          # knows the name but nothing offers it: every MIPS cross toolchain lives in
+          # Ubuntu's `universe` component, which runner images do not always enable.
+          have_candidate() {
+            apt-cache policy "$1" 2>/dev/null | grep -qE 'Candidate: *[0-9]'
+          }
+          enable_universe() {
+            echo "--- enabling universe ---" >>"$log"
+            { echo "os-release: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+              echo "arch: $(dpkg --print-architecture 2>/dev/null)"
+              echo "sources:"; grep -rhE '^(deb|URIs|Components|Suites)' \
+                   /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null
+            } >>"$log" 2>&1
+            sudo apt-get install -y --no-install-recommends software-properties-common >>"$log" 2>&1
+            if command -v add-apt-repository >/dev/null 2>&1 \
+               && sudo add-apt-repository -y universe >>"$log" 2>&1; then
+              sudo apt-get update -y >>"$log" 2>&1
+              return 0
+            fi
+            # add-apt-repository may be absent or the sources may be deb822: write a
+            # legacy one-line source for universe directly.
+            suite=$(. /etc/os-release 2>/dev/null && echo "$VERSION_CODENAME")
+            mirror="http://archive.ubuntu.com/ubuntu"
+            case "$(dpkg --print-architecture 2>/dev/null)" in
+              amd64|i386) ;;
+              *) mirror="http://ports.ubuntu.com/ubuntu-ports" ;;
+            esac
+            printf 'deb %s %s universe\ndeb %s %s-updates universe\n' \
+                   "$mirror" "$suite" "$mirror" "$suite" \
+              | sudo tee /etc/apt/sources.list.d/ci-universe.list >>"$log" 2>&1
+            sudo apt-get update -y >>"$log" 2>&1
+          }
+          universe_state="already-enabled"
+          if ! have_candidate gcc-mipsel-linux-gnu; then
+            enable_universe
+            if have_candidate gcc-mipsel-linux-gnu; then
+              universe_state="enabled-by-ci"
+            else
+              universe_state="could-not-be-enabled"
+              why="universe could not be enabled on this runner"
+            fi
+          fi
+          echo "universe=$universe_state" >> "$GITHUB_OUTPUT"
+          { echo "--- apt-cache policy after universe=$universe_state ---"
+            apt-cache policy gcc-mipsel-linux-gnu libc6-dev-mipsel-cross binutils-mipsel-linux-gnu
+          } >>"$log" 2>&1
+          # The mipsel sysroot (libc + headers). Needed for any real device link and
+          # for the clang fallback below to compile against the right ABI.
+          sudo apt-get install -y --no-install-recommends libc6-dev-mipsel-cross >>"$log" 2>&1
+
+          # Every MIPS package name Ubuntu/Debian has shipped, plus binutils on its
+          # own (ar/objcopy/readelf are needed even if the compiler is absent).
+          sudo apt-get install -y --no-install-recommends binutils-mipsel-linux-gnu >>"$log" 2>&1
+          for cand in gcc-mipsel-linux-gnu gcc-mips-linux-gnu \
+                      gcc-mips64el-linux-gnuabi64 gcc-mipsisa32r6el-linux-gnu; do
+            if sudo apt-get install -y --no-install-recommends "$cand" >>"$log" 2>&1; then
+              pkg="$cand"; break
+            fi
+            why="$(grep -m1 -E 'Unable to locate|E:|Depends' "$log" | tail -1)"
+          done
+          for pref in mipsel-linux-gnu mips-linux-gnu mips64el-linux-gnuabi64 mipsisa32r6el-linux-gnu; do
+            if command -v "${pref}-gcc" >/dev/null 2>&1; then cross="$pref"; break; fi
+          done
+
+          # Fallback: clang cross-compiles to MIPS32 LE with no MIPS gcc installed.
+          # Only accepted if a real probe compiles AND readelf confirms EM_MIPS, so
+          # this can never report a toolchain that does not actually work.
+          if [ -z "$cross" ]; then
+            sudo apt-get install -y --no-install-recommends clang lld llvm >>"$log" 2>&1
+            if command -v clang >/dev/null 2>&1; then
+              cbin="$HOME/.local/crossbin"; mkdir -p "$cbin"
+              cat > "$cbin/mipsel-linux-gnu-gcc" <<'WRAP'
+          #!/bin/sh
+          # Only ever compile against the mipsel sysroot. Falling back to the host
+          # /usr/include would silently produce x86_64-ABI objects labelled MIPS.
+          SR=""
+          [ -d /usr/mipsel-linux-gnu ] && SR="--sysroot=/usr/mipsel-linux-gnu"
+          exec clang --target=mipsel-linux-gnu -march=mips32 -mabi=32 -EL $SR "$@"
+          WRAP
+              chmod +x "$cbin/mipsel-linux-gnu-gcc"
+              for tool in ar ranlib nm objcopy objdump readelf size strip; do
+                src="$(command -v "llvm-$tool" 2>/dev/null || command -v "$tool" 2>/dev/null)"
+                [ -n "$src" ] && ln -sf "$src" "$cbin/mipsel-linux-gnu-$tool"
+              done
+              export PATH="$cbin:$PATH"
+              printf '#include <stdio.h>\n#include <stdint.h>\nint main(void){uint32_t x=1;printf("%%u\\n",x);return 0;}\n' > /tmp/probe.c
+              if mipsel-linux-gnu-gcc -c /tmp/probe.c -o /tmp/probe.o 2>/tmp/probe.err \
+                 && readelf -h /tmp/probe.o 2>/dev/null | grep -q "MIPS"; then
+                cross="mipsel-linux-gnu"; pkg="clang (target cross-compile, no MIPS gcc available)"
+              else
+                cat /tmp/probe.err >>"$log"
+                probe_why=$(head -2 /tmp/probe.err 2>/dev/null | tr '\n' ' ' | cut -c1-180)
+                why="clang MIPS probe produced no MIPS object: ${probe_why:-readelf did not report EM_MIPS}"
+                rm -f "$cbin"/mipsel-linux-gnu-*
+              fi
+            else
+              why="${why:-no MIPS gcc package could be installed and clang is unavailable}"
+            fi
+          fi
+
+          echo "cross=$cross" >> "$GITHUB_OUTPUT"
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+          echo "why=$why" >> "$GITHUB_OUTPUT"
+          if [ -n "$cross" ]; then
+            echo "cross toolchain: ${cross}-gcc -> $(${cross}-gcc --version 2>&1 | head -1)"
+            echo "installed via: ${pkg:-preinstalled}"
+          else
+            # The apt/clang reason goes into an annotation, so it is readable from
+            # the run page and from the check-runs API without downloading logs.
+            detail="$(grep -m3 -E 'Unable to locate|E: |error:|not going to be installed' "$log" | tr '\n' '|' | cut -c1-300)"
+            echo "::warning title=device/cross-install::no MIPS cross compiler available (universe=$universe_state). ${why}. apt said: ${detail:-no apt error captured}"
+          fi
+          echo "--- cross-toolchain-install.log (tail) ---"
+          tail -25 "$log"
+
+      - name: Start trace
+        run: |
+          set -euo pipefail
+          mkdir -p "$TRACE/steps" "$CIOUT/report" "$CIOUT/stage-device"
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" init --job device
+          if [ -n "${{ steps.cross.outputs.cross }}" ]; then st=ok; else st=degraded; fi
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name cross-toolchain --status "$st" \
+            --message "cross=${{ steps.cross.outputs.cross || 'none' }} package=${{ steps.cross.outputs.package || 'none' }} universe=${{ steps.cross.outputs.universe || 'unknown' }} device_link=$DEVICE_LINK reason=${{ steps.cross.outputs.why || 'none' }}"
+
+      - name: Cross-compile every translation unit
+        id: compile
+        if: steps.cross.outputs.cross != ''
+        run: |
+          set -euo pipefail
+          CROSS="${{ steps.cross.outputs.cross }}-"
+          # Tolerated, not fatal: on a stock runner the five units that include
+          # <openssl/*.h> cannot compile, and stopping here would hide the 28 that can.
+          if python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+               --name device-compile --cwd "$CR" --tool make --timeout 1200 --allow-fail \
+               --consumes "$CIOUT/tree-manifest.json" \
+               --message "a partial compile is expected on a stock runner: see the note below" \
+               -- make -k -f Makefile.mips objects CROSS="$CROSS"; then
+            echo "attempt=crosstool-sysroot" >> "$GITHUB_OUTPUT"
+          else
+            echo "attempt=crosstool-partial" >> "$GITHUB_OUTPUT"
+          fi
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name openssl-units \
+            --status warn --message "cam_keys, crypto_tls, crypto_ctr, http_client and runtime_e2e include <openssl/*.h> and were deliberately NOT compiled against the host OpenSSL headers. Ubuntu ships opensslconf.h/configuration.h only under /usr/include/x86_64-linux-gnu, and those are build-specific: BN_ULONG width, word size and endianness come from the machine OpenSSL was built for. Objects compiled against the x86_64 headers would silently disagree with a real MIPS libcrypto at link time, which is the worst possible outcome for firmware. Supply a MIPS OpenSSL sysroot (vendor SDK or self-hosted runner) to build these five."
+
+      - name: Compile matrix (per translation unit)
+        if: steps.cross.outputs.cross != ''
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name device-compile-matrix --cwd "$CR" --tool bash \
+            --produces "$CR/build-mips/compile-matrix.md,$CR/build-mips/expected-objects.txt" \
+            -- bash -c 'set -u; mkdir -p build-mips; CROSS="${{ steps.cross.outputs.cross }}-"; make -f Makefile.mips print-OBJS CROSS="$CROSS" | tr -s " \t" "\n" | sed "/^$/d" > build-mips/expected-objects.txt; { echo "# Device compile matrix (MIPS32 LE)"; echo; echo "| translation unit | object |"; echo "|------------------|--------|"; while read -r o; do [ -z "$o" ] && continue; b=$(basename "$o" .o); if [ -f "$o" ]; then echo "| src/$b.c | OK |"; else echo "| src/$b.c | **MISSING** |"; fi; done < build-mips/expected-objects.txt; } > build-mips/compile-matrix.md; cat build-mips/compile-matrix.md'
+
+      - name: Archive the MIPS objects
+        if: steps.cross.outputs.cross != ''
+        run: |
+          set -euo pipefail
+          CROSS="${{ steps.cross.outputs.cross }}-"
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name device-archive --cwd "$CR" --tool "${CROSS}ar" --allow-fail \
+            --produces "$CR/build-mips/libcleanroom_mips.a" \
+            -- bash -c "cd build-mips && ls *.o >/dev/null 2>&1 && ${CROSS}ar rcs libcleanroom_mips.a *.o && echo \"archived \$(ls *.o | wc -l) object(s)\" && ${CROSS}ar t libcleanroom_mips.a | wc -l"
+
+      - name: Static link + objcopy (needs a MIPS libcrypto)
+        if: steps.cross.outputs.cross != ''
+        run: |
+          set -euo pipefail
+          CROSS="${{ steps.cross.outputs.cross }}-"
+          AF=""
+          if [ "$DEVICE_LINK" != "required" ]; then AF="--allow-fail"; fi
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name device-link --cwd "$CR" --tool make --timeout 900 $AF \
+            --consumes "$CR/build-mips/libcleanroom_mips.a" \
+            --produces "$CR/build-mips/cleanroom_mips.elf,$CR/build-mips/cleanroom_mips.bin" \
+            --message "the device link needs libcrypto built for MIPS; Ubuntu publishes no libssl-dev for mips/mipsel, so this is expected to degrade on stock runners" \
+            -- make -f Makefile.mips all CROSS="$CROSS"
+
+      - name: Inspect + verify device artifacts
+        if: steps.cross.outputs.cross != ''
+        run: |
+          set -euo pipefail
+          CROSS="${{ steps.cross.outputs.cross }}-"
+          if [ -f "$CR/build-mips/cleanroom_mips.bin" ]; then
+            python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+              --name device-binary-info --cwd "$CR" --tool bash \
+              --consumes "$CR/build-mips/cleanroom_mips.elf,$CR/build-mips/cleanroom_mips.bin" \
+              --produces "$CR/build-mips/device-binary-info.txt" \
+              -- bash -c "{ file build-mips/cleanroom_mips.elf build-mips/cleanroom_mips.bin; echo; ${CROSS}readelf -h build-mips/cleanroom_mips.elf; echo; ${CROSS}size build-mips/cleanroom_mips.elf; echo; sha256sum build-mips/cleanroom_mips.elf build-mips/cleanroom_mips.bin; } > build-mips/device-binary-info.txt 2>&1"
+            python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report"
+            python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+              --name device-verify --tool python3 --timeout 300 \
+              --consumes "$CR/build-mips/cleanroom_mips.elf,$CR/build-mips/cleanroom_mips.bin,$CIOUT/report/artifact-chain.json" \
+              --produces "$CIOUT/report/device-VERIFICATION.md,$CIOUT/report/device-verification.json" \
+              -- python3 "$CR/ci/verify_artifacts.py" \
+                   --elf "$CR/build-mips/cleanroom_mips.elf" \
+                   --expect-machine mips --expect-endian little --expect-entry 0x80000e00 \
+                   --binary "$CR/build-mips/cleanroom_mips.bin" --max-bytes 0x2A2F7C \
+                   --chain "$CIOUT/report/artifact-chain.json" \
+                   --out-json "$CIOUT/report/device-verification.json" \
+                   --out-md "$CIOUT/report/device-VERIFICATION.md"
+          else
+            python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name device-verify --status degraded \
+              --message "no device binary was produced, so ELF/entry-point verification was skipped; the link error is in ERRORS.md"
+          fi
+
+      - name: Device build status
+        id: status
+        if: always()
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          mkdir -p "$CR/build-mips"
+          objs=$(find "$CR/build-mips" -maxdepth 1 -name '*.o' 2>/dev/null | wc -l) || objs=0
+          # Authoritative expectation comes from the Makefile, not from src/*.c:
+          # the device build compiles device_main.c instead of main.c.
+          # (--no-print-directory + grep: "Entering/Leaving directory" banners
+          #  would otherwise be counted as objects.)
+          srcs=$(make -C "$CR" --no-print-directory -f Makefile.mips print-OBJS CROSS=probe- 2>/dev/null \
+                 | tr -s ' \t' '\n' | grep -c '\.o$' || true)
+          [ "$srcs" -gt 0 ] || srcs=$(ls "$CR"/src/*.c 2>/dev/null | wc -l)
+          missing=$(grep -o 'src/[a-z_0-9]*\.c | \*\*MISSING\*\*' "$CR/build-mips/compile-matrix.md" 2>/dev/null | cut -d' ' -f1 | paste -sd, - || true)
+          bin="$CR/build-mips/cleanroom_mips.bin"
+          if [ -f "$bin" ]; then link=linked; else link=not-linked; fi
+          mkdir -p "$CR/build-mips"
+          {
+            echo "# Device build status"
+            echo
+            echo "- cross toolchain: \`${{ steps.cross.outputs.cross || 'NOT AVAILABLE'}}\`"
+            echo "- compile attempt: \`${{ steps.compile.outputs.attempt || 'skipped' }}\`"
+            echo "- objects built: **$objs / $srcs** translation units"
+            [ -n "$missing" ] && echo "- missing objects: \`$missing\`"
+            echo "- static link: **$link**"
+            echo "- device_link policy: \`$DEVICE_LINK\`"
+            echo "- flashable maincode: $([ -f "$bin" ] && echo 'yes' || echo 'no — the package job stages a 0xFF placeholder and marks the image NOT FLASHABLE')"
+            echo
+            if [ "$objs" -gt 0 ] && [ "$objs" -lt "$srcs" ]; then
+              echo "## Translation units that did not cross-compile"
+              echo
+              echo "\`compile-matrix.md\` lists them one by one and the compiler stderr for"
+              echo "each is in \`ERRORS.md\` / \`steps/*device-compile*.err\`. On a stock runner"
+              echo "these are always the five units that include \`<openssl/*.h>\`"
+              echo "(\`cam_keys\`, \`crypto_tls\`, \`crypto_ctr\`, \`http_client\`, \`runtime_e2e\`):"
+              echo "the cross sysroot has no OpenSSL headers, and they are deliberately not"
+              echo "compiled against the host x86_64 ones. \`opensslconf.h\` and"
+              echo "\`configuration.h\` are build-specific — BN_ULONG width, word size and"
+              echo "endianness come from the machine OpenSSL was built for — so objects built"
+              echo "against them would silently disagree with a real MIPS libcrypto at link"
+              echo "time. Supply a MIPS OpenSSL sysroot to build these five units."
+              echo
+            fi
+            if [ "$objs" -eq 0 ]; then
+              echo "## No translation unit could be cross-compiled"
+              echo
+              echo "Toolchain resolution: \`${{ steps.cross.outputs.why || 'unknown' }}\`."
+              echo "\`cross-toolchain-install.log\` in this artifact holds the full apt"
+              echo "and clang output. Install \`gcc-mipsel-linux-gnu\` (or run on a"
+              echo "self-hosted runner that has it) and re-run."
+              echo
+            fi
+            if [ ! -f "$bin" ]; then
+              echo "## Why the link did not complete"
+              echo
+              echo "The device link is \`-static ... -lcrypto\`. Ubuntu publishes no"
+              echo "\`libssl-dev\` for mips/mipsel, so a stock runner cannot resolve"
+              echo "\`libcrypto.a\` for the target. The exact linker stderr is in"
+              echo "\`ERRORS.md\` and \`steps/*device-link.err\`."
+              echo
+              echo "To get a real flashable image, provide a MIPS sysroot that contains"
+              echo "\`libcrypto.a\` + the OpenSSL headers (vendor SDK or a self-hosted"
+              echo "runner), then re-run with \`device_link=required\`. See"
+              echo "\`BOOT_READINESS_GAP_REPORT.md\`."
+            fi
+          } > "$CR/build-mips/DEVICE_BUILD_STATUS.md"
+          cat "$CR/build-mips/DEVICE_BUILD_STATUS.md"
+          echo "link_status=$link" >> "$GITHUB_OUTPUT"
+          echo "objects=$objs" >> "$GITHUB_OUTPUT"
+          echo "expected_objects=$srcs" >> "$GITHUB_OUTPUT"
+          echo "device_bin=$([ -f "$bin" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          cross="${{ steps.cross.outputs.cross }}"
+          if [ -z "$cross" ]; then
+            # No MIPS compiler could be obtained on this runner. That is an
+            # environment gap, not a defect in this commit, so it is reported
+            # loudly instead of turning the run red. `device_link=required`
+            # upgrades it to a hard failure for anyone who needs the binary.
+            echo "toolchain=unavailable" >> "$GITHUB_OUTPUT"
+            if [ "$DEVICE_LINK" = "required" ]; then
+              echo "::error title=device::device_link=required but no MIPS cross toolchain could be installed (universe=${{ steps.cross.outputs.universe || 'unknown' }})"
+              exit 1
+            fi
+            echo "::warning title=device::no MIPS cross toolchain on this runner (universe=${{ steps.cross.outputs.universe || 'unknown' }}) — no device objects, no archive and no flash maincode were built; see DEVICE_BUILD_STATUS.md and cross-toolchain-install.log in the cleanroom-device artifact"
+            exit 0
+          fi
+          echo "toolchain=$cross" >> "$GITHUB_OUTPUT"
+          if [ "$objs" -eq 0 ]; then
+            echo "::error title=device::a MIPS cross compiler ($cross) was available but not one translation unit compiled"
+            exit 1
+          fi
+          if [ "$objs" -lt "$srcs" ]; then
+            echo "::warning title=device::only $objs of $srcs translation units cross-compiled (${missing:-unknown})"
+          fi
+          if [ "$DEVICE_LINK" = "required" ] && [ "$link" != "linked" ]; then
+            echo "::error title=device::device_link=required but the static link produced no binary"
+            exit 1
+          fi
+
+      - name: Final report + stage artifact
+        if: always()
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
+          mkdir -p "$CIOUT/stage-device"
+          for f in libcleanroom_mips.a cleanroom_mips.elf cleanroom_mips.bin \
+                   compile-matrix.md DEVICE_BUILD_STATUS.md device-binary-info.txt; do
+            [ -f "$CR/build-mips/$f" ] && cp -v "$CR/build-mips/$f" "$CIOUT/stage-device/"
+          done
+          [ -f "$CIOUT/cross-toolchain-install.log" ] \
+            && cp -v "$CIOUT/cross-toolchain-install.log" "$CIOUT/stage-device/"
+          cp -rv "$CIOUT"/report/* "$CIOUT/stage-device/" 2>/dev/null || true
+          (cd "$CIOUT/stage-device" && sha256sum ./* 2>/dev/null | tee SHA256SUMS.txt) || true
+
+      - name: Upload device artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanroom-device
+          path: ${{ env.CIOUT }}/stage-device/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload device trace (tool chain + error logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-device
+          path: ${{ env.CIOUT }}/trace-device/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ----------------------------------------------------------------------- #
+  package:
+    name: Pack + verify flash image
+    runs-on: ubuntu-latest
+    needs: [prepare, device]
+    if: always() && !cancelled() && needs.prepare.result == 'success'
+    timeout-minutes: 15
+    env:
+      TRACE: ci-out/trace-package
+      TOOLTRACE_JOB: package
+    outputs:
+      flashable: ${{ steps.status.outputs.flashable }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Take delivery of the device artifact (chained from device)
+        id: delivery
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cleanroom-device
+          path: ${{ env.CIOUT }}/in/device
+
+      - name: Start trace
+        run: |
+          set -euo pipefail
+          mkdir -p "$TRACE/steps" "$CIOUT/report" "$CIOUT/stage-flash"
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" init --job package
+          MAINCODE="$GITHUB_WORKSPACE/$CIOUT/in/device/cleanroom_mips.bin"
+          if [ -f "$MAINCODE" ]; then st=ok; msg="device binary received: $(sha256sum "$MAINCODE" | cut -c1-16)"; else st=degraded; msg="no device binary in the cleanroom-device artifact — a 0xFF placeholder maincode will be staged"; fi
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name artifact-handoff --status "$st" --message "$msg"
+
+      - name: Stage the three flash partitions
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name flash-parts --cwd "$CR" --tool python3 --timeout 300 \
+            --consumes "$CIOUT/in/device/cleanroom_mips.bin" \
+            --produces "$CR/build/flash_parts/part_bootloader_raw.bin,$CR/build/flash_parts/part_kernel_raw.bin,$CR/build/flash_parts/part_maincode_raw.bin,$CR/build/flash_parts/flash_parts.json,$CR/build/FLASH_IMAGE_README.txt" \
+            -- python3 ci/prepare_flash_parts.py \
+                 --out-dir build/flash_parts \
+                 --readme build/FLASH_IMAGE_README.txt \
+                 --maincode "$GITHUB_WORKSPACE/$CIOUT/in/device/cleanroom_mips.bin"
+
+      - name: Pack the NCRC flash image
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name flash-pack --cwd "$CR" --tool python3 --timeout 300 \
+            --consumes "$CR/build/flash_parts/part_bootloader_raw.bin,$CR/build/flash_parts/part_kernel_raw.bin,$CR/build/flash_parts/part_maincode_raw.bin" \
+            --produces "$CR/build/flash_image.bin" \
+            -- python3 tools/pack_flash_image.py \
+                 --bootloader build/flash_parts/part_bootloader_raw.bin \
+                 --kernel     build/flash_parts/part_kernel_raw.bin \
+                 --maincode   build/flash_parts/part_maincode_raw.bin \
+                 --out        build/flash_image.bin
+
+      - name: Render trace report (chain for the verifier)
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report"
+
+      - name: Verify the flash image (NCRC headers + CRC32 + maincode chain)
+        run: |
+          set -euo pipefail
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
+            --name flash-verify --tool python3 --timeout 300 \
+            --consumes "$CR/build/flash_image.bin,$CR/build/flash_parts/part_maincode_raw.bin,$CIOUT/report/artifact-chain.json" \
+            --produces "$CIOUT/report/flash-VERIFICATION.md,$CIOUT/report/flash-verification.json" \
+            -- python3 "$CR/ci/verify_artifacts.py" \
+                 --flash-image "$CR/build/flash_image.bin" \
+                 --maincode    "$CR/build/flash_parts/part_maincode_raw.bin" \
+                 --chain       "$CIOUT/report/artifact-chain.json" \
+                 --out-json    "$CIOUT/report/flash-verification.json" \
+                 --out-md      "$CIOUT/report/flash-VERIFICATION.md"
+
+      - name: Flash-image status
+        id: status
+        run: |
+          set -euo pipefail
+          FLASHABLE=$(python3 -c "import json;print(str(json.load(open('$CR/build/flash_parts/flash_parts.json'))['flashable']).lower())")
+          echo "flashable=$FLASHABLE" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "packed image"
+            echo "------------"
+            ls -l "$CR/build/flash_image.bin"
+            sha256sum "$CR/build/flash_image.bin"
+            echo "commit      : ${GITHUB_SHA:-local}"
+            echo "verification: see flash-VERIFICATION.md in this artifact"
+          } >> "$CR/build/FLASH_IMAGE_README.txt"
+          cat "$CR/build/FLASH_IMAGE_README.txt"
+          if [ "$FLASHABLE" != "true" ]; then
+            echo "::warning title=flash-image::image is NOT flashable — it contains synthetic partition(s); see FLASH_IMAGE_README.txt"
+            python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name flash-image-flashable \
+              --status degraded --message "image contains synthetic partitions and must not be flashed"
+          else
+            python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name flash-image-flashable \
+              --status ok --message "all three partitions are real; image is flashable"
+          fi
+
+      - name: Final report + stage artifact
+        if: always()
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" report --out "$CIOUT/report" || true
+          mkdir -p "$CIOUT/stage-flash"
+          for f in "$CR/build/flash_image.bin" "$CR/build/FLASH_IMAGE_README.txt" \
+                   "$CR/build/flash_parts/flash_parts.json"; do
+            [ -f "$f" ] && cp -v "$f" "$CIOUT/stage-flash/"
+          done
+          cp -rv "$CIOUT"/report/* "$CIOUT/stage-flash/" 2>/dev/null || true
+          (cd "$CIOUT/stage-flash" && sha256sum ./* 2>/dev/null | tee SHA256SUMS.txt) || true
+
+      - name: Upload flash image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-image
+          path: ${{ env.CIOUT }}/stage-flash/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload package trace (tool chain + error logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-package
+          path: ${{ env.CIOUT }}/trace-package/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ----------------------------------------------------------------------- #
+  report:
+    name: Tool chain + error log report
+    runs-on: ubuntu-latest
+    needs: [prepare, host, device, package]
+    if: always() && !cancelled()
+    timeout-minutes: 10
+    env:
+      TOOLTRACE_JOB: report
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect every job trace
+        uses: actions/download-artifact@v4
+        with:
+          pattern: trace-*
+          path: ${{ env.CIOUT }}/traces
+          merge-multiple: false
+
+      - name: Collect every artifact
+        id: collect
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cleanroom-*
+          path: ${{ env.CIOUT }}/artifacts
+
+      - name: Collect the flash image artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: flash-image
+          path: ${{ env.CIOUT }}/artifacts/flash-image
+
+      - name: Merge traces into one report
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          mkdir -p "$CIOUT/report"
+          SOURCES=()
+          for d in "$CIOUT"/traces/*/; do [ -d "$d" ] && SOURCES+=("$d"); done
+          echo "trace dirs: ${SOURCES[*]:-none}"
+          python3 "$CR/ci/tooltrace.py" --dir "$CIOUT/traces" merge \
+            --out "$CIOUT/report" --artifacts-root "$CIOUT/artifacts" --step-summary \
+            "${SOURCES[@]}"
+          cp -v "$CIOUT"/artifacts/*/*VERIFICATION.md "$CIOUT/report/" 2>/dev/null || true
+          cp -v "$CIOUT"/artifacts/*/*verification.json "$CIOUT/report/" 2>/dev/null || true
+          cp -v "$CIOUT"/artifacts/*/DEVICE_BUILD_STATUS.md "$CIOUT/report/" 2>/dev/null || true
+          cp -v "$CIOUT"/artifacts/*/flash_parts.json "$CIOUT/report/" 2>/dev/null || true
+          cp -v "$CIOUT"/artifacts/*/FLASH_IMAGE_README.txt "$CIOUT/report/" 2>/dev/null || true
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          {
+            echo "### Pipeline"
+            echo
+            echo "| job | result |"
+            echo "|-----|--------|"
+            echo "| prepare | ${{ needs.prepare.result }} |"
+            echo "| host | ${{ needs.host.result }} |"
+            echo "| device | ${{ needs.device.result }} (toolchain: ${{ needs.device.outputs.toolchain || 'n/a' }}, objects: ${{ needs.device.outputs.objects || 'n/a' }}, link: ${{ needs.device.outputs.link_status || 'n/a' }}) |"
+            echo "| package | ${{ needs.package.result }} (flashable: ${{ needs.package.outputs.flashable || 'n/a' }}) |"
+            echo
+            if [ "${{ needs.device.outputs.toolchain }}" = "unavailable" ]; then
+              echo "> :warning: **No MIPS cross toolchain on this runner.** The host build is"
+              echo "> fully tested; the device objects, archive and flash maincode were not"
+              echo "> produced. \`cleanroom-device/cross-toolchain-install.log\` records every"
+              echo "> apt and clang attempt, and \`DEVICE_BUILD_STATUS.md\` says what to install."
+              echo ">"
+            fi
+            echo "Download **ci-report** for \`TOOLCHAIN.md\` (tool chain), \`ARTIFACT_CHAIN.md\`"
+            echo "(provenance + hashes) and \`ERRORS.md\` (stderr of every failure)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -f "$CIOUT/report/ERRORS.md" ] && sed -n '1,40p' "$CIOUT/report/ERRORS.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload ci-report (tool chain + error logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: ${{ env.CIOUT }}/report/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Pipeline status
+        if: always()
+        run: |
+          set -uo pipefail
+          # GitHub Actions runs every `run:` block as `bash -e`, so an
+          # intentional non-zero (a missing dir, a tolerated failure) would
+          # abort this reporting step before it could say anything useful.
+          set +e
+          rc=0
+          echo "prepare=${{ needs.prepare.result }} host=${{ needs.host.result }} device=${{ needs.device.result }} package=${{ needs.package.result }}"
+          [ "${{ needs.prepare.result }}" = "success" ] || rc=1
+          [ "${{ needs.host.result }}" = "success" ] || rc=1
+          [ "${{ needs.device.result }}" = "failure" ] && rc=1
+          [ "${{ needs.package.result }}" = "failure" ] && rc=1
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=pipeline::one or more jobs failed — see the ci-report artifact (ERRORS.md)"
+          fi
+          exit "$rc"

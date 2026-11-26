@@ -1,0 +1,16 @@
+# CI scratch space and build outputs live in the Actions run as artifacts,
+# never in git.
+ci-out/
+re_workspace/04_cleanroom/build/
+re_workspace/04_cleanroom/build-mips/
+
+# stray build products
+*.o
+*.obj
+*.pyc
+__pycache__/
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp

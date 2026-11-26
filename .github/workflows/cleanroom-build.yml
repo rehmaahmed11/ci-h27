@@ -246,6 +246,7 @@ jobs:
       link_status: ${{ steps.status.outputs.link_status }}
       objects: ${{ steps.status.outputs.objects }}
       device_bin: ${{ steps.status.outputs.device_bin }}
+      toolchain: ${{ steps.status.outputs.toolchain }}
     steps:
       - uses: actions/checkout@v4
 
@@ -276,13 +277,49 @@ jobs:
           # "Package 'gcc-mipsel-linux-gnu' has no installation candidate" means apt
           # knows the name but nothing offers it: every MIPS cross toolchain lives in
           # Ubuntu's `universe` component, which runner images do not always enable.
-          if ! apt-cache policy gcc-mipsel-linux-gnu 2>/dev/null | grep -qE 'Candidate: *[0-9]'; then
-            echo "--- no candidate; enabling universe ---" >>"$log"
-            sudo add-apt-repository -y universe >>"$log" 2>&1
+          have_candidate() {
+            apt-cache policy "$1" 2>/dev/null | grep -qE 'Candidate: *[0-9]'
+          }
+          enable_universe() {
+            echo "--- enabling universe ---" >>"$log"
+            { echo "os-release: $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+              echo "arch: $(dpkg --print-architecture 2>/dev/null)"
+              echo "sources:"; grep -rhE '^(deb|URIs|Components|Suites)' \
+                   /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null
+            } >>"$log" 2>&1
+            sudo apt-get install -y --no-install-recommends software-properties-common >>"$log" 2>&1
+            if command -v add-apt-repository >/dev/null 2>&1 \
+               && sudo add-apt-repository -y universe >>"$log" 2>&1; then
+              sudo apt-get update -y >>"$log" 2>&1
+              return 0
+            fi
+            # add-apt-repository may be absent or the sources may be deb822: write a
+            # legacy one-line source for universe directly.
+            suite=$(. /etc/os-release 2>/dev/null && echo "$VERSION_CODENAME")
+            mirror="http://archive.ubuntu.com/ubuntu"
+            case "$(dpkg --print-architecture 2>/dev/null)" in
+              amd64|i386) ;;
+              *) mirror="http://ports.ubuntu.com/ubuntu-ports" ;;
+            esac
+            printf 'deb %s %s universe\ndeb %s %s-updates universe\n' \
+                   "$mirror" "$suite" "$mirror" "$suite" \
+              | sudo tee /etc/apt/sources.list.d/ci-universe.list >>"$log" 2>&1
             sudo apt-get update -y >>"$log" 2>&1
-            why="universe was not enabled (enabled it and re-ran apt-get update)"
+          }
+          universe_state="already-enabled"
+          if ! have_candidate gcc-mipsel-linux-gnu; then
+            enable_universe
+            if have_candidate gcc-mipsel-linux-gnu; then
+              universe_state="enabled-by-ci"
+            else
+              universe_state="could-not-be-enabled"
+              why="universe could not be enabled on this runner"
+            fi
           fi
-          apt-cache policy gcc-mipsel-linux-gnu >>"$log" 2>&1
+          echo "universe=$universe_state" >> "$GITHUB_OUTPUT"
+          { echo "--- apt-cache policy after universe=$universe_state ---"
+            apt-cache policy gcc-mipsel-linux-gnu libc6-dev-mipsel-cross binutils-mipsel-linux-gnu
+          } >>"$log" 2>&1
           # The mipsel sysroot (libc + headers). Needed for any real device link and
           # for the clang fallback below to compile against the right ABI.
           sudo apt-get install -y --no-install-recommends libc6-dev-mipsel-cross >>"$log" 2>&1
@@ -347,7 +384,7 @@ jobs:
             # The apt/clang reason goes into an annotation, so it is readable from
             # the run page and from the check-runs API without downloading logs.
             detail="$(grep -m3 -E 'Unable to locate|E: |error:|not going to be installed' "$log" | tr '\n' '|' | cut -c1-300)"
-            echo "::warning title=device/cross-install::no MIPS cross compiler available. ${why}. apt said: ${detail:-no apt error captured}"
+            echo "::warning title=device/cross-install::no MIPS cross compiler available (universe=$universe_state). ${why}. apt said: ${detail:-no apt error captured}"
           fi
           echo "--- cross-toolchain-install.log (tail) ---"
           tail -25 "$log"
@@ -359,7 +396,7 @@ jobs:
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" init --job device
           if [ -n "${{ steps.cross.outputs.cross }}" ]; then st=ok; else st=degraded; fi
           python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name cross-toolchain --status "$st" \
-            --message "cross=${{ steps.cross.outputs.cross || 'none' }} package=${{ steps.cross.outputs.package || 'none' }} device_link=$DEVICE_LINK reason=${{ steps.cross.outputs.why || 'none' }}"
+            --message "cross=${{ steps.cross.outputs.cross || 'none' }} package=${{ steps.cross.outputs.package || 'none' }} universe=${{ steps.cross.outputs.universe || 'unknown' }} device_link=$DEVICE_LINK reason=${{ steps.cross.outputs.why || 'none' }}"
 
       - name: Cross-compile every translation unit
         id: compile
@@ -516,8 +553,23 @@ jobs:
           echo "objects=$objs" >> "$GITHUB_OUTPUT"
           echo "expected_objects=$srcs" >> "$GITHUB_OUTPUT"
           echo "device_bin=$([ -f "$bin" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          cross="${{ steps.cross.outputs.cross }}"
+          if [ -z "$cross" ]; then
+            # No MIPS compiler could be obtained on this runner. That is an
+            # environment gap, not a defect in this commit, so it is reported
+            # loudly instead of turning the run red. `device_link=required`
+            # upgrades it to a hard failure for anyone who needs the binary.
+            echo "toolchain=unavailable" >> "$GITHUB_OUTPUT"
+            if [ "$DEVICE_LINK" = "required" ]; then
+              echo "::error title=device::device_link=required but no MIPS cross toolchain could be installed (universe=${{ steps.cross.outputs.universe || 'unknown' }})"
+              exit 1
+            fi
+            echo "::warning title=device::no MIPS cross toolchain on this runner (universe=${{ steps.cross.outputs.universe || 'unknown' }}) — no device objects, no archive and no flash maincode were built; see DEVICE_BUILD_STATUS.md and cross-toolchain-install.log in the cleanroom-device artifact"
+            exit 0
+          fi
+          echo "toolchain=$cross" >> "$GITHUB_OUTPUT"
           if [ "$objs" -eq 0 ]; then
-            echo "::error title=device::no translation unit cross-compiled — either no MIPS cross compiler could be installed or every compile failed"
+            echo "::error title=device::a MIPS cross compiler ($cross) was available but not one translation unit compiled"
             exit 1
           fi
           if [ "$objs" -lt "$srcs" ]; then
@@ -770,9 +822,16 @@ jobs:
             echo "|-----|--------|"
             echo "| prepare | ${{ needs.prepare.result }} |"
             echo "| host | ${{ needs.host.result }} |"
-            echo "| device | ${{ needs.device.result }} (link: ${{ needs.device.outputs.link_status || 'n/a' }}, objects: ${{ needs.device.outputs.objects || 'n/a' }}) |"
+            echo "| device | ${{ needs.device.result }} (toolchain: ${{ needs.device.outputs.toolchain || 'n/a' }}, objects: ${{ needs.device.outputs.objects || 'n/a' }}, link: ${{ needs.device.outputs.link_status || 'n/a' }}) |"
             echo "| package | ${{ needs.package.result }} (flashable: ${{ needs.package.outputs.flashable || 'n/a' }}) |"
             echo
+            if [ "${{ needs.device.outputs.toolchain }}" = "unavailable" ]; then
+              echo "> :warning: **No MIPS cross toolchain on this runner.** The host build is"
+              echo "> fully tested; the device objects, archive and flash maincode were not"
+              echo "> produced. \`cleanroom-device/cross-toolchain-install.log\` records every"
+              echo "> apt and clang attempt, and \`DEVICE_BUILD_STATUS.md\` says what to install."
+              echo ">"
+            fi
             echo "Download **ci-report** for \`TOOLCHAIN.md\` (tool chain), \`ARTIFACT_CHAIN.md\`"
             echo "(provenance + hashes) and \`ERRORS.md\` (stderr of every failure)."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -235,7 +235,12 @@ jobs:
   # ----------------------------------------------------------------------- #
   device:
     name: Device build (MIPS32 LE)
-    runs-on: ubuntu-latest
+    # Pinned deliberately. `ubuntu-latest` is ubuntu-26.04, and Ubuntu dropped
+    # mipsel when Debian dropped it for trixie: there apt reports
+    # "Package 'gcc-mipsel-linux-gnu' has no installation candidate" and
+    # binutils/libc6 -mipsel-cross are gone entirely, so no amount of
+    # universe-enabling helps. noble still ships the whole cross toolchain.
+    runs-on: ubuntu-24.04
     needs: prepare
     timeout-minutes: 25
     env:
@@ -265,6 +270,11 @@ jobs:
           log="$CIOUT/cross-toolchain-install.log"
           : > "$log"
           cross=""; pkg=""; why=""
+          { echo "--- runner ---"
+            . /etc/os-release 2>/dev/null && echo "os: $PRETTY_NAME ($VERSION_CODENAME)"
+            echo "arch: $(dpkg --print-architecture 2>/dev/null)"
+            echo "runner: ${RUNNER_OS:-?} / ${RUNNER_NAME:-?}"
+          } >>"$log" 2>&1
 
           # Runner images no longer always ship populated apt lists, so an install
           # without a working update fails with "Unable to locate package".

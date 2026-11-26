@@ -414,23 +414,19 @@ jobs:
         run: |
           set -euo pipefail
           CROSS="${{ steps.cross.outputs.cross }}-"
+          # Tolerated, not fatal: on a stock runner the five units that include
+          # <openssl/*.h> cannot compile, and stopping here would hide the 28 that can.
           if python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
-               --name device-compile --cwd "$CR" --tool make --timeout 1200 \
+               --name device-compile --cwd "$CR" --tool make --timeout 1200 --allow-fail \
                --consumes "$CIOUT/tree-manifest.json" \
-               -- make -f Makefile.mips objects CROSS="$CROSS"; then
+               --message "a partial compile is expected on a stock runner: see the note below" \
+               -- make -k -f Makefile.mips objects CROSS="$CROSS"; then
             echo "attempt=crosstool-sysroot" >> "$GITHUB_OUTPUT"
           else
-            # The cross sysroot has no OpenSSL headers; the four units that include
-            # <openssl/*.h> only need declarations, so retry against the host headers.
-            if python3 "$CR/ci/tooltrace.py" --dir "$TRACE" run \
-                 --name device-compile-host-headers --cwd "$CR" --tool make --timeout 1200 --allow-fail \
-                 --message "retry with -I/usr/include (host OpenSSL headers) for cam_keys/crypto_tls/crypto_ctr/http_client" \
-                 -- make -k -f Makefile.mips objects CROSS="$CROSS" EXTRA_CFLAGS=-I/usr/include; then
-              echo "attempt=host-openssl-headers" >> "$GITHUB_OUTPUT"
-            else
-              echo "attempt=failed" >> "$GITHUB_OUTPUT"
-            fi
+            echo "attempt=crosstool-partial" >> "$GITHUB_OUTPUT"
           fi
+          python3 "$CR/ci/tooltrace.py" --dir "$TRACE" note --name openssl-units \
+            --status warn --message "cam_keys, crypto_tls, crypto_ctr, http_client and runtime_e2e include <openssl/*.h> and were deliberately NOT compiled against the host OpenSSL headers. Ubuntu ships opensslconf.h/configuration.h only under /usr/include/x86_64-linux-gnu, and those are build-specific: BN_ULONG width, word size and endianness come from the machine OpenSSL was built for. Objects compiled against the x86_64 headers would silently disagree with a real MIPS libcrypto at link time, which is the worst possible outcome for firmware. Supply a MIPS OpenSSL sysroot (vendor SDK or self-hosted runner) to build these five."
 
       - name: Compile matrix (per translation unit)
         if: steps.cross.outputs.cross != ''
@@ -530,9 +526,15 @@ jobs:
               echo "## Translation units that did not cross-compile"
               echo
               echo "\`compile-matrix.md\` lists them one by one and the compiler stderr for"
-              echo "each is in \`ERRORS.md\` / \`steps/*device-compile*.err\`. The usual cause"
-              echo "on a stock runner is that the cross sysroot has no OpenSSL headers for"
-              echo "the four units that include \`<openssl/*.h>\`."
+              echo "each is in \`ERRORS.md\` / \`steps/*device-compile*.err\`. On a stock runner"
+              echo "these are always the five units that include \`<openssl/*.h>\`"
+              echo "(\`cam_keys\`, \`crypto_tls\`, \`crypto_ctr\`, \`http_client\`, \`runtime_e2e\`):"
+              echo "the cross sysroot has no OpenSSL headers, and they are deliberately not"
+              echo "compiled against the host x86_64 ones. \`opensslconf.h\` and"
+              echo "\`configuration.h\` are build-specific — BN_ULONG width, word size and"
+              echo "endianness come from the machine OpenSSL was built for — so objects built"
+              echo "against them would silently disagree with a real MIPS libcrypto at link"
+              echo "time. Supply a MIPS OpenSSL sysroot to build these five units."
               echo
             fi
             if [ "$objs" -eq 0 ]; then

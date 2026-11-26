@@ -44,7 +44,7 @@ SHA-256, so the chain is auditable end to end.
 |---|---|
 | `ci-report` | **start here.** `CI_REPORT.md`, `TOOLCHAIN.md`, `ARTIFACT_CHAIN.md`, `ERRORS.md`, all verifications, the merged `toolchain.jsonl` and every per-step log |
 | `cleanroom-host` | `cleanroom_p0`, `selftest.log`, `host-binary-info.txt`, host verification, per-job trace reports, `SHA256SUMS.txt` |
-| `cleanroom-device` | `libcleanroom_mips.a`, `cleanroom_mips.elf`/`.bin` when the link completes, `compile-matrix.md`, `DEVICE_BUILD_STATUS.md`, device verification |
+| `cleanroom-device` | `libcleanroom_mips.a`, `cleanroom_mips.elf`/`.bin` when the link completes, `compile-matrix.md`, `DEVICE_BUILD_STATUS.md`, `cross-toolchain-install.log`, device verification |
 | `flash-image` | `flash_image.bin` (4 MiB), `flash_parts.json`, `FLASH_IMAGE_README.txt`, flash verification |
 | `source-manifest` | `tree-manifest.json` — per-file SHA-256 of the whole source tree |
 | `trace-prepare` / `trace-host` / `trace-device` / `trace-package` | each job's own trace, uploaded with `if: always()` so a single failing job is still inspectable |
@@ -73,24 +73,45 @@ anything.
 
 ## The device (MIPS) link, honestly
 
-The device link is `-static … -lcrypto`. **Ubuntu publishes no `libssl-dev` for
-mips/mipsel**, so on a stock GitHub-hosted runner the final link cannot resolve
-`libcrypto.a` for the target, and the cross sysroot has no OpenSSL headers either.
+The device link is `-static … -lssl -lcrypto`. **Ubuntu publishes no `libssl-dev`
+for mips/mipsel**, so on a stock GitHub-hosted runner the final link cannot resolve
+the OpenSSL libraries for the target, and the cross sysroot has no OpenSSL headers
+either. That is why the five units including `<openssl/*.h>` (`cam_keys`,
+`crypto_tls`, `crypto_ctr`, `http_client`, `runtime_e2e`) do not compile there; the
+other **28 do**, and they are archived into a real MIPS `libcleanroom_mips.a`.
+
+Those five are deliberately **not** compiled against the host x86_64 OpenSSL
+headers. Debian and Ubuntu install `opensslconf.h` and `configuration.h` only under
+`/usr/include/x86_64-linux-gnu/openssl/`, and both are build-specific: `BN_ULONG`
+width, word size and endianness come from the machine OpenSSL was built for. MIPS
+o32 objects compiled against them would silently disagree with a real MIPS
+libcrypto at link time — the worst possible failure mode for firmware. The pipeline
+records that reasoning as a trace note instead of guessing.
+
+**Runner image.** `ubuntu-latest` is now ubuntu-26.04, and Ubuntu dropped mipsel
+when Debian dropped it for trixie — there, `apt` reports *"Package
+'gcc-mipsel-linux-gnu' has no installation candidate"* and
+`binutils-mipsel-linux-gnu` / `libc6-dev-mipsel-cross` are gone entirely, so no
+amount of enabling `universe` helps. The `device` job is therefore **pinned to
+`ubuntu-24.04`**, which still ships the whole cross toolchain; the other four jobs
+stay on `ubuntu-latest` because they need nothing architecture-specific.
 
 Rather than fail silently or fake it, the pipeline:
 
-* cross-compiles everything it can (`make -k`), retries the four OpenSSL-dependent
-  units against the host headers, and records **both** attempts;
+* cross-compiles everything it can (`make -k`) and records the attempt;
 * publishes `compile-matrix.md` naming each translation unit that did not compile;
 * archives the objects it did produce (`libcleanroom_mips.a`) as a real MIPS artifact;
 * records the link failure as `WARN` with the exact linker stderr in `ERRORS.md`;
+* treats "no MIPS toolchain could be installed" as a loud **warning** (an
+  environment gap this commit cannot fix) but "toolchain present and zero units
+  compiled" as a hard **failure** — `device_link=required` upgrades the former too;
 * writes `DEVICE_BUILD_STATUS.md` explaining the cause and the fix;
 * stages a 0xFF placeholder maincode, packs the image anyway (so the packer and
   verifier stay under test), and marks it **`flashable: false`** in
   `flash_parts.json` and `FLASH_IMAGE_README.txt`.
 
-To get a genuinely flashable image, provide a MIPS sysroot containing `libcrypto.a`
-and the OpenSSL headers (vendor SDK, or a self-hosted runner), then re-run with
+To get a genuinely flashable image, provide a MIPS sysroot containing `libssl.a`,
+`libcrypto.a` and the OpenSSL headers (vendor SDK, or a self-hosted runner), then re-run with
 `device_link=required` so a missing binary fails the run instead of warning. See
 `re_workspace/04_cleanroom/BOOT_READINESS_GAP_REPORT.md`.
 
